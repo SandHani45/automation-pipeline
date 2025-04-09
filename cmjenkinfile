@@ -1,0 +1,835 @@
+import groovy.json.JsonSlurper
+import hudson.model.Job
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.time.ZoneId;
+import java.time.LocalDateTime;
+
+pipeline {
+  agent {
+    label 'docker_new_jdk17'
+  }
+  options {
+    skipDefaultCheckout true
+    buildDiscarder(
+      logRotator(
+        daysToKeepStr: '365'
+      )
+    )
+  }
+  environment {
+    project = 'PPCM'
+    summary = 'myProduct:Price - Production release'
+    contacts = 'AmitKumar.Dash@tesco.com,Deepchand.Swami@tesco.com,Karthik.Maranahalli@tesco.com,RohitVarghese.Koshy@tesco.com,Ronak.Amlani@tesco.com,Sandip.Pal@tesco.com,Shaik.Sandhani@tesco.com,Vinu.Nair@tesco.com,Sandeep.Chugh@tesco.com'
+    approver = 'IN22916686'
+    impactedApplication = 'myProduct:Price application'
+
+    github = 'github.dev.global.tesco.org/30PriceandPromotions/MyProductPrice.git'
+
+    healthCheckUrlUI = 'https://toolkit.tesco.com/price/healthcheck'
+    healthCheckUrlExpAPI = 'https://toolkit.tesco.com/price/api/healthcheck'
+    healthCheckUrlUI_PPE = 'https://toolkit-ppe.tesco.com/price/healthcheck'
+    healthCheckUrlExpAPI_PPE = 'https://toolkit-ppe.tesco.com/price/api/healthcheck'
+
+    uiReleaseJob = 'price-ui-release-pipeline'
+    expApiReleaseJob = 'experience-api-release-pipeline'
+    priceServiceApiReleaseJob = 'price-service-api-release-pipeline'
+
+    jiraProjectKey = 'MYPP'
+
+    uiUnitTestsJob = 'price-ui-cd-pipeline'
+    expAPIUnitTestsJob = 'experience-api-cd-pipeline'
+    backEndUnitTestResultsJob= 'price-service-api-cd-pipeline'
+
+    expAPIDockerImageName = 'euwdevprice.azurecr.io/experience-api-dev'
+    uiDockerImageName = 'euwdevprice.azurecr.io/price-ui-dev'
+
+    expAPITestFile = 'Exp-Api-Test-Report.html'
+    uiTestFile = 'UI-Test-Report.html'
+
+    GIT_CREDENTIALS = credentials('git-credentials')
+    TENANT_ID = credentials('AzureTenant')
+    UK_BUYER_USERNAME = credentials('CUSTOM_PARTNER_UK_BUYER_USERNAME')
+    UK_BUYER_PASSWORD = credentials('CUSTOM_PARTNER_UK_BUYER_PASSWORD')
+    NEXUS_SERVICE_ACCOUNT_SECRET = credentials('NEXUS_OURTESCO_TOKEN_NAME_PASSCODE_BASE64')
+    DEV_SP_CLIENT_ID = credentials('DEV_SP_CLIENT_ID')
+    DEV_SP_CLIENT_SECRET = credentials('DEV_SP_CLIENT_SECRET')
+    DEV_ACR_NAME = credentials('DEV_ACR_NAME')
+    DEV_ACR_PASSWORD = credentials('DEV_ACR_PASSWORD')
+    DEV_SUBSCRIPTION_ID = credentials('DEV_SUBSCRIPTION_ID')
+
+    BRANCH_NAME = "main"
+  }
+  parameters {
+
+    booleanParam(name: 'UI', defaultValue: false, description: 'please select if you want to release the UI code')
+    booleanParam(name: 'EXP_API', defaultValue: false,  description: 'please select if you want to release the exp-api code')
+    booleanParam(name: 'PRICE_SERVICE', defaultValue: false,  description: 'please selectif you want to release the Price service backend code')
+    booleanParam(name: 'TESTING_SCRIPTS', defaultValue: false, description: 'Please select this only for testing the pipeline groovy script. No CM ticket creation will happen.')
+    text(name: 'MANUAL_STEPS')
+    choice(choices:['INE12363866:Vinu','IN22917791:Sandip','IN22911792:Rohit','INE12363275:Deepchand','INE12362822:Karthik','INE12374908:Shaik','INE12394923:Ronak','IN22917921:Amit'], description: 'Owner of this release', name: 'Reporter')
+    string(name: 'RELEASE_DATE', defaultValue: '',description: 'The format is YYYY-MM-DDTHH:MM , Sample Date Format - 2024-01-05T10:00')
+    text(name: 'CHANGE_REASON')
+  }
+  stages {
+    stage('Testing Script') {
+      when {
+        expression {
+          return params.TESTING_SCRIPTS
+        }
+      }
+      steps {
+        script {
+          testingScript()
+        }
+      }
+    }
+    stage('Set the release date') {
+      steps {
+        script {
+          setReleaseDate()
+        }
+      }
+    }
+    stage('Fetch build versions from PPE') {
+      steps {
+        script {
+          fetchPPEBuildVersions()
+        }
+      }
+    }
+    stage('Set versions & generate description') {
+      steps {
+        script {
+          List<String> allStoryList = new ArrayList<>()
+          List<String> frontendStoryList = new ArrayList<>()
+          List<String> expAPIStoryList = new ArrayList<>()
+          List<String> priceServiceStoryList = new ArrayList<>()
+
+          if (params.UI) {
+             env.BUILD_VERSION_UI = generateVersion(env.github, env.BUILD_VERSION_UI)
+
+             env.PREVIOUS_UI_VERSION = fetchBuildVersion(env.healthCheckUrlUI)
+             println "Currently deployed UI version: ${env.PREVIOUS_UI_VERSION}"
+
+             frontendStoryList = generateStoryListFromGit(env.PREVIOUS_UI_VERSION, env.BUILD_VERSION_UI).unique()
+             allStoryList.addAll(frontendStoryList);
+          }
+          if (params.EXP_API) {
+             env.BUILD_VERSION_EXP_API = generateVersion(env.github, env.BUILD_VERSION_EXP_API)
+
+             env.PREVIOUS_EXP_API_VERSION = fetchBuildVersion(env.healthCheckUrlExpAPI)
+             println "Currently deployed EXP API version: ${env.PREVIOUS_EXP_API_VERSION}"
+
+             expAPIStoryList = generateStoryListFromGit(env.PREVIOUS_EXP_API_VERSION, env.BUILD_VERSION_EXP_API).unique()
+             allStoryList.addAll(expAPIStoryList);
+          }
+          if(params.PRICE_SERVICE) {
+             env.BUILD_VERSION_PRICE_SERVICE = generateVersion(env.github, env.BUILD_VERSION_PRICE_SERVICE)
+
+             env.PREVIOUS_PRICE_SERVICE_VERSION = fetchBackendBuildVersion('Price Service', 'prod')
+             println "Currently deployed Price Service version: ${env.PREVIOUS_PRICE_SERVICE_VERSION}"
+
+             priceServiceStoryList = generateStoryListFromGit(env.PREVIOUS_PRICE_SERVICE_VERSION, env.BUILD_VERSION_PRICE_SERVICE).unique()
+             allStoryList.addAll(priceServiceStoryList);
+
+          }
+          println "Stories in repository: $allStoryList"
+          env.description = generateDescription(allStoryList.unique())
+          env.frontendStories=frontendStoryList
+          env.expAPIStories = expAPIStoryList
+          env.priceServiceStories = priceServiceStoryList
+          env.allStories = allStoryList
+          env.releaseBuildLink = "Release build - " + "${currentBuild.getAbsoluteUrl()}" + "\r\n"
+        }
+      }
+    }
+    stage('Create CM') {
+      steps {
+        script {
+          def releaseOwner = params.Reporter.split(':')[0]
+          print "releaseOwner = ${releaseOwner}"
+          def issue = [
+              fields: [
+                  project: [key: env.project],
+                  summary: env.summary,
+                  description: env.description,
+                  issuetype: [name: 'Change Request'],
+                  assignee: [name: env.approver],
+                  customfield_10700: [value: 'Normal'],
+                  customfield_10705: env.RELEASE_START_TIME,
+                  customfield_10706: env.RELEASE_END_TIME,
+                  customfield_10702: [value: 'Low'],
+                  customfield_10703: [value: 'Low'],
+                  customfield_10608: [[value: 'UK'],[value: 'ROI']],
+                  customfield_10711: env.contacts,
+                  customfield_10707: generateTestResults(),
+                  customfield_10900: [value: 'Yes'],
+                  customfield_10708: generateImplementationPlan(),
+                  customfield_10709: 'Do a round of sanity with both UK and ROI test user',
+                  customfield_10710: generateBackoutPlan(),
+                  customfield_16900: "${params.CHANGE_REASON}",
+                  customfield_16901: 'myProduct:Price application',
+                  customfield_16902: 'No risks, as we will be deploying during non-business hours',
+                  customfield_21400: 'Revert the build nos to previous stable versions deployed in Prod \nDo a round of sanity',
+                  customfield_21401: 'PPE'
+              ]]
+          def newIssue = jiraNewIssue issue: issue, site: 'Tesco Jira'
+          env.CM_KEY = newIssue.data.key
+          println "New issue created: ${newIssue.data.key}"
+          /* def newIssue = jiraEditIssue idOrKey: 'PPCM-2792', issue: issue, site: 'Tesco Jira'
+          println "Edited issue response: \n\r$newIssue"
+          env.CM_KEY = 'PPCM-2792' */
+        }
+      }
+    }
+    stage('Running Automation Test') {
+      stages {
+/*         stage('Price Service Automation') {
+          when{
+            expression{
+              return params.PRICE_SERVICE
+            }
+          }
+          steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                  echo 'Automation Test has started...........'
+                  git branch: "${env.BRANCH_NAME}",
+                  credentialsId: 'git-credentials',
+                  url: "https://${env.github}"
+                    dir("E2E/api-automation") {
+                        withEnv(["E2E_AUTOMATION_ENV=ppe", "UK_BUYER_USERNAME=${env.PARTNER_UK_BUYER_USERNAME}","UK_BUYER_PASSWORD=${env.PARTNER_UK_BUYER_PASSWORD}"]) {
+                            sh """
+                                ./gradlew clean test -Dhttps.socketTimeout=120000 -Dhttps.connectionTimeout=120000
+                              """
+                        }
+                    }
+                }
+            }
+            post {
+                success {
+                  echo 'Backend Automation Test has completed'
+                  sh """
+                      apk add zip
+                      zip -r price-service-automation-report.zip  E2E/api-automation/build/reports/tests/**
+                  """
+                }
+                failure {
+                  echo 'Backend Automation Test has failed'
+                }
+            }
+          } */
+        stage('UI unit test') {
+          when{
+            expression{
+              return params.UI
+            }
+          }
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                sh """
+                  az login --service-principal -t ${env.TENANT_ID} -u ${env.DEV_SP_CLIENT_ID} -p ${env.DEV_SP_CLIENT_SECRET}
+                  az acr login --name euwdevprice --username ${env.DEV_ACR_NAME} --password ${env.DEV_ACR_PASSWORD} --subscription ${env.DEV_SUBSCRIPTION_ID}
+                  docker rm tc || true
+                  docker cp \$(docker create --name tc ${env.uiDockerImageName}:${env.BUILD_VERSION_UI}):/${env.uiTestFile} ./${env.uiTestFile} && docker rm tc
+                """
+              }
+            }
+          }
+          post {
+            success {
+              echo 'UI Unit Test has succeeded'
+            }
+            failure {
+              echo 'UI Unit Test has failed'
+            }
+          }
+        }
+        stage('Exp API unit test') {
+          when{
+            expression{
+              return params.EXP_API
+            }
+          }
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                sh """
+                  az login --service-principal -t ${env.TENANT_ID} -u ${env.DEV_SP_CLIENT_ID} -p ${env.DEV_SP_CLIENT_SECRET}
+                  az acr login --name euwdevprice --username ${env.DEV_ACR_NAME} --password ${env.DEV_ACR_PASSWORD} --subscription ${env.DEV_SUBSCRIPTION_ID}
+                  docker rm tc || true
+                  docker cp \$(docker create --name tc ${env.expAPIDockerImageName}:${env.BUILD_VERSION_EXP_API}):/var/tesco/apps/experience-api/${env.expAPITestFile} ./${env.expAPITestFile} && docker rm tc
+                """
+              }
+            }
+          }
+          post {
+            success {
+              echo 'Experience API Unit Test has succeeded'
+            }
+            failure {
+              echo 'Experience API Unit Test has failed'
+            }
+          }
+        }
+        stage('Attaching Test Report') {
+          steps {
+            script {
+              uploadTestResultFiles()
+            }
+          }
+        }
+      }
+    }
+    stage('Ready for approval transition') {
+      steps {
+        script {
+          def transitionInput = [
+              fields: [
+                  customfield_15502: env.RELEASE_START_TIME,
+                  customfield_16000: env.RELEASE_END_TIME
+              ],
+              update: [
+                comment: [[ add: [ body: "PPCM is ready for approval" ]]]
+              ],
+              transition: [
+                  id: '11'
+              ]
+          ]
+          jiraTransitionIssue idOrKey: env.CM_KEY, input: transitionInput, site: 'Tesco Jira'
+        }
+      }
+    }
+    stage('Pause before release') {
+      steps{
+        script{
+          def now = ZonedDateTime.now().withZoneSameInstant(ZoneId.of("Asia/Kolkata"))
+          def cm = jiraGetIssue idOrKey: env.CM_KEY, site: 'Tesco Jira'
+          def startTime = ZonedDateTime.parse(cm.data.fields.customfield_15502, formatter()).withZoneSameInstant(ZoneId.of("Asia/Kolkata"))
+          def endTime = ZonedDateTime.parse(cm.data.fields.customfield_16000, formatter()).withZoneSameInstant(ZoneId.of("Asia/Kolkata"))
+          println "Start time: $startTime, End time: $endTime, Now: $now"
+
+          if (startTime.isAfter(now)) {
+            def waitTime = ChronoUnit.MINUTES.between(now, startTime)
+            println "Waiting $waitTime minutes until the release start time reached"
+            sleep time:waitTime, unit:'MINUTES'
+            now = ZonedDateTime.now().withZoneSameInstant(ZoneId.of("Asia/Kolkata"))
+          }
+
+          if(checkIfCMApproved()) {
+            println 'CM approved'
+
+            if (endTime.isAfter(now)) {
+              println 'Checks passed starting next step'
+              env.VERDICT = 'yes'
+            } else {
+              println 'Checks failed, not proceeding with the release'
+              env.VERDICT = 'no'
+            }
+          } else {
+            println 'CM has not been approved in time'
+            env.VERDICT = 'no'
+            throw new RuntimeException()
+          }
+        }
+      }
+    }
+
+    stage('Running release jobs') {
+      when{
+        expression{
+          return VERDICT == 'yes'
+        }
+      }
+      stages {
+        stage('UI release job') {
+          when{
+            expression{
+              return params.UI
+            }
+          }
+          steps {
+            script {
+              def result = build job: env.uiReleaseJob, propagate: false, parameters: [
+                [
+                    $class: 'StringParameterValue',
+                    name: 'BUILD_VERSION',
+                    value: "${env.BUILD_VERSION_UI}"
+                ],
+                [
+                        $class: 'StringParameterValue',
+                        name: 'PPCM_TICKET',
+                        value: "${env.CM_KEY}"
+                ],
+                [
+                    $class: 'StringParameterValue',
+                    name: 'environment',
+                    value: 'prod',
+                ]
+            ]
+              println(result.getAbsoluteUrl())
+              env.releaseBuildLink +=  "UI build -  " +result.getAbsoluteUrl() + "\r\n"
+            }
+          }
+        }
+        stage('EXP release job') {
+          when{
+            expression{
+              return params.EXP_API
+            }
+          }
+          steps {
+            script {
+               def result = build job: env.expApiReleaseJob, propagate: false, parameters: [
+                [
+                    $class: 'StringParameterValue',
+                    name: 'BUILD_VERSION',
+                    value: "${env.BUILD_VERSION_EXP_API}"
+                ],
+                [
+                        $class: 'StringParameterValue',
+                        name: 'PPCM_TICKET',
+                        value: "${env.CM_KEY}"
+                ],
+                [
+                    $class: 'StringParameterValue',
+                    name: 'environment',
+                    value: 'prod',
+                ]
+            ]
+              println(result.getAbsoluteUrl())
+              env.releaseBuildLink +=  "EXP API build - " +result.getAbsoluteUrl() + "\r\n"
+
+            }
+          }
+        }
+        stage('Price Service release job') {
+          when{
+            expression{
+              return params.PRICE_SERVICE
+            }
+          }
+          steps {
+            script {
+                def result = build job: env.priceServiceApiReleaseJob, propagate: false, parameters: [
+                [
+                    $class: 'StringParameterValue',
+                    name: 'BUILD_VERSION',
+                    value: "${env.BUILD_VERSION_PRICE_SERVICE}"
+                ],
+                [
+                        $class: 'StringParameterValue',
+                        name: 'PPCM_TICKET',
+                        value: "${env.CM_KEY}"
+                ],
+                [
+                    $class: 'StringParameterValue',
+                    name: 'environment',
+                    value: 'prod',
+                ]
+            ]
+              println(result.getAbsoluteUrl())
+              env.releaseBuildLink +=  "Price Service build - " +result.getAbsoluteUrl() + "\r\n"
+            }
+          }
+        }
+        stage('Sending Email') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script{
+                def bodyText = "Hi Team,  <p>We have successfully completed the production release.</p> "
+                bodyText += "<table border=1px style='width:75%'><tr><th>Task</th><th>Status</th><th>Build No</th></tr>"
+
+                if (params.UI) {
+                  bodyText += "<tr><td>UI deployment</td><td>Done</td><td>${env.BUILD_VERSION_UI}</td></tr>"
+                }
+                if (params.EXP_API) {
+                  bodyText += "<tr><td>Exp API deployment</td><td>Done</td><td>${env.BUILD_VERSION_EXP_API}</td></tr>"
+                }
+                if(params.PRICE_SERVICE) {
+                  bodyText += "<tr><td>Price Service deployment</td><td>Done</td><td>${env.BUILD_VERSION_PRICE_SERVICE}</td></tr>"
+                }
+
+                bodyText += "<tr><td>Sanity Test</td><td>Not Started</td><td>NA</td></tr></table>"
+                bodyText += "<p>CM ticket ref: https://jira.global.tesco.org/browse/${env.CM_KEY}</p>"
+                bodyText+= "<p>Note: This is a automatic mail from CM Ticket prod release jenkins pipeline, Please do not reply to this mail</p>"
+
+                emailext to: "${env.contacts}",
+                          mimeType: 'text/html',
+                          subject: "Production Deployment - MyProductPrice",
+                          body: bodyText
+
+              }
+            }
+          }
+        }
+        stage('Pause for Tag released') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script{
+                      def verdict = input message: 'Do you want to move released tickets to done , CM to Successful implementation and Tag released commit?',
+                        parameters: [choice(choices:['yes', 'no'], description: 'verdict', name: 'verdict')]
+                        VERDICT = verdict
+              }
+            }
+          }
+        }
+        stage('Move released tickets to done') {
+          when{
+                expression{
+                  return VERDICT == 'yes'
+                }
+          }
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                println "Move released tickets to done"
+                List<JiraTicket> jiraTickets = getTicketsFromJira()
+                jiraTickets.each {
+                  jiraTicket ->
+                    if (env.allStories.contains(jiraTicket.getIssueKey())) {
+                        def transitionInput = null
+                        if (Arrays.asList("Story", "Task").contains(jiraTicket.getIssueTypeName())) {
+                          transitionInput = [
+                              transition: [
+                                  id: '261' //move to Done
+                              ]
+                          ]
+                        }
+                        if (jiraTicket.getIssueTypeName().equals("Defect")) {
+                          transitionInput = [
+                              transition: [
+                                  id: '411' //move to Done
+                              ]
+                          ]
+                        }
+                        jiraTransitionIssue idOrKey: jiraTicket.getIssueKey(), input: transitionInput, site: 'Tesco Jira'
+                    }
+                }
+              }
+            }
+          }
+        }
+        stage('Move CM to Successful implementation') {
+          when{
+                expression{
+                  return VERDICT == 'yes'
+                }
+          }
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                println "Moving the  CM to Successful implementation"
+                def transitionInput = [
+                    fields    : [
+                        customfield_15502: env.RELEASE_START_TIME,
+                        customfield_16000: env.RELEASE_END_TIME,
+                        customfield_10712: [ id: "12021", value: "Successful Implementation" ]
+                    ],
+                    update    : [
+                        comment: [[ add: [ body: "Change successfully implemented. \r\n"  + "${env.releaseBuildLink}" ]]]
+                    ],
+                    transition: [
+                        id: '31'
+                    ]
+                ]
+                jiraTransitionIssue idOrKey: env.CM_KEY, input: transitionInput, site: 'Tesco Jira'
+              }
+            }
+          }
+        }
+        stage('Tag released commit') {
+          when{
+                expression{
+                  return VERDICT == 'yes'
+                }
+          }
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              script {
+                println "Tagging the  released commit"
+                if (params.UI) {
+                    tagCommit(github, env.BUILD_VERSION_UI, "UI")
+                }
+                if (params.EXP_API) {
+                  tagCommit(github, env.BUILD_VERSION_EXP_API, "EXP")
+                }
+              if(params.PRICE_SERVICE) {
+                  tagCommit(github, env.BUILD_VERSION_PRICE_SERVICE, "BE")
+              }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+private void tagCommit(String githubUrl, String buildVersion, String service) {
+  sh """mkdir -p tags"""
+
+  dir('tags') {
+    git branch: env.BRANCH_NAME,
+            credentialsId: 'git-credentials',
+            url: "https://${githubUrl}"
+
+    sh """
+      git remote set-url origin https://${env.GIT_CREDENTIALS}@${githubUrl}
+      git config --global user.email "30_Commercial_DevOps@tesco.com"
+      git config --global user.name "svc-tne-cicd"
+      git checkout $buildVersion
+      git tag -a ${env.CM_KEY}-${service} -m ${env.CM_KEY}-${service}
+      git push --tags
+    """
+  }
+
+  sh """rm -r tags"""
+}
+
+private void setReleaseDate() {
+    // DO NOT CHANGE
+    lengthOfRelease = 120
+    if(params.RELEASE_DATE) {
+        START_TIME = LocalDateTime.parse(params.RELEASE_DATE, DateTimeFormatter.ISO_DATE_TIME).atZone(ZoneId.of("Asia/Kolkata"))
+        END_TIME = START_TIME.plusMinutes(lengthOfRelease)
+        env.RELEASE_START_TIME = START_TIME.format(formatter())
+        env.RELEASE_END_TIME = END_TIME.format(formatter())
+        println("RELEASE_START_TIME = " + env.RELEASE_START_TIME)
+        println("RELEASE_END_TIME = " + env.RELEASE_END_TIME)
+
+    } else {
+        throw new RuntimeException("Release date is not provided")
+    }
+
+}
+
+
+private DateTimeFormatter formatter() {
+  return DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
+}
+
+private void testingScript() {
+
+
+    ZonedDateTime zonedDateTime = LocalDateTime.parse("2023-12-02T10:00", DateTimeFormatter.ISO_DATE_TIME).atZone(ZoneId.of("Asia/Kolkata"))
+    println("ZonedDateTime custom- " + zonedDateTime);
+    println("ZonedDateTime custom with formatter " + zonedDateTime.format(formatter()))
+
+    ZonedDateTime.parse("2021-07-06T08:21:16.192+0000", formatter())
+    println("ZonedDateTime.now()")
+    def now = ZonedDateTime.now()
+    println("ChronoUnit.MINUTES.between")
+    ChronoUnit.MINUTES.between(now, now)
+    println("new ArrayList<>()")
+    List<String> backendStoryList = new ArrayList<>()
+    println(".findAll()")
+    ("stories" =~ /s+/).findAll()
+    println("now.isAfter(now)")
+    now.isAfter(now)
+    println(".getItemByFullName")
+    throw new RuntimeException("Dont continue after test script")
+
+}
+
+private void fetchPPEBuildVersions() {
+    if (params.UI) {
+         env.BUILD_VERSION_UI = fetchBuildVersion(env.healthCheckUrlUI_PPE)
+         println "PPE App build version for UI: ${env.BUILD_VERSION_UI}"
+  }
+  if (params.EXP_API) {
+        env.BUILD_VERSION_EXP_API = fetchBuildVersion(env.healthCheckUrlExpAPI_PPE)
+        println "PPE App build version for Exp API: ${env.BUILD_VERSION_EXP_API}"
+  }
+  if(params.PRICE_SERVICE) {
+        env.BUILD_VERSION_PRICE_SERVICE = fetchBackendBuildVersion('Price Service', 'ppe')
+        println "PPE Build version for Price Service: ${env.BUILD_VERSION_PRICE_SERVICE}"
+  }
+}
+
+private def fetchBuildVersion(String healthCheckUrl) {
+    def healthCheck = httpRequest url:healthCheckUrl, quiet:true
+    println "Calling healthcheck for $healthCheckUrl: $healthCheck"
+    if (healthCheck.status == 200) {
+        return new JsonSlurper().parseText(healthCheck.content).BUILD_NUMBER
+    } else {
+        throw new RuntimeException("Not able to reach ${env.impactedApplication} healthcheck. URL: ${healthCheckUrl}")
+    }
+}
+
+private def fetchBackendBuildVersion(String service, String env) {
+   def healthCheck = callBackendHealthCheck(service, env)
+    if (healthCheck.status == 200) {
+        return new JsonSlurper().parseText(healthCheck.content).BUILD_NUMBER
+    } else {
+        throw new RuntimeException("Not able to reach ${env.impactedApplication} healthcheck for $service")
+    }
+}
+
+private def callBackendHealthCheck(String service, String env) {
+     if(service == 'Price Service') {
+            def healthCheckUrl = "https://origin-euw.price-proxy."+env+".cdo.tesco.com/priceservice/api/healthcheck"
+            def serviceName= "price-service-api-"+env+".price-"+env+".svc.cluster.local"
+            def response = httpRequest url:healthCheckUrl, ignoreSslErrors: true, consoleLogResponseBody: false, validResponseCodes: '200',
+                                    customHeaders: [ [name:'auth',value:'off'], [name:'servicename',value:serviceName] ]
+            return response;
+     }
+     else if(service == 'Extract Service') {
+        return null
+     }
+}
+
+private String generateVersion(def githubUrl, def overwriteVersion) {
+  git branch: env.BRANCH_NAME,
+      credentialsId: 'git-credentials',
+      url: "https://${githubUrl}"
+
+  if (overwriteVersion) {
+    sh "git checkout $overwriteVersion"
+    println "Checked out $overwriteVersion"
+  }
+
+  return sh(
+      script: 'git rev-parse --short=7 HEAD',
+      returnStdout: true
+  ).trim()
+}
+
+private List<String> generateStoryListFromGit(String previousCommit, String currentCommit) {
+  def stories = sh (
+      script: "git log --format=short $previousCommit..$currentCommit",
+      returnStdout: true
+  ).trim()
+
+  return (stories =~ /${env.jiraProjectKey}-\d+/).findAll()
+}
+
+private String generateDescription(List<String> allStoryList) {
+  def result = "${params.CHANGE_REASON}\n\nTickets with Ready for Deployment: \r\n"
+  Map<String,String> jiraTicketKeySummary = new HashMap<>()
+
+  getTicketsFromJira().each {
+    jiraTicket ->   jiraTicketKeySummary.put(jiraTicket.getIssueKey(), jiraTicket.getSummary())
+
+  }
+
+  if(allStoryList.size() > 0) {
+    allStoryList.each {
+      ticket -> result += generateStoryLine(ticket, jiraTicketKeySummary)
+    }
+  } else {
+    result += 'No story found in the github repository \r\n'
+  }
+
+  println "Generated description: \n\r$result"
+  return result
+}
+
+private List<JiraTicket> getTicketsFromJira() {
+  def response = jiraJqlSearch jql: "project = ${env.jiraProjectKey}  AND status = \"Ready for Deployment\"", site: 'Tesco Jira', failOnError: true, maxResults: 250
+  def tickets = response.data.issues
+  List<JiraTicket> results = new ArrayList<JiraTicket>()
+  tickets.each {ticket -> results.add(new JiraTicket(ticket.key, ticket.fields.summary, ticket.fields.issuetype.name))}
+  return results
+}
+
+private String generateStoryLine(String ticket, Map<String,String> jiraTicketKeySummary) {
+    if(jiraTicketKeySummary.containsKey(ticket)) {
+    return ticket + ':' + jiraTicketKeySummary.get(ticket)  + '\r\n'
+  } else {
+    return ticket + ' -> [Not Ready for Deployment]\r\n'
+  }
+}
+
+
+private String generateTestResults() {
+    String result = ""
+    if (params.UI) {
+        result += "UI test results: [^${env.uiTestFile}] \r\n\r\n"
+    }
+    if (params.EXP_API) {
+        result += "Experience API test results: [^${env.expAPITestFile}] \r\n\r\n"
+    }
+    if(params.PRICE_SERVICE) {
+        result += "Backend automation test results: [^price-service-automation-report.zip] \r\n\r\n"
+    }
+  return result
+}
+
+private String generateImplementationPlan() {
+  def plan = "${params.MANUAL_STEPS}"
+  plan += "\r\n Auto deploying with the following versions: \r\n"
+  if (params.UI) {
+    plan += " - UI: ${env.BUILD_VERSION_UI} \r\n"
+  }
+  if (params.EXP_API) {
+    plan += " - Exp API: ${env.BUILD_VERSION_EXP_API} \r\n"
+  }
+  if(params.PRICE_SERVICE) {
+     plan += " - Price Service: ${env.BUILD_VERSION_PRICE_SERVICE} \r\n"
+  }
+  return plan
+}
+
+private String generateBackoutPlan() {
+  def plan = "Revert the build nos to previous stable versions deployed in Prod: \r\n "
+  if (params.UI) {
+    plan += " - UI: $env.PREVIOUS_UI_VERSION \r\n"
+  }
+    if (params.EXP_API) {
+    plan += " - Exp API: $env.PREVIOUS_EXP_API_VERSION \r\n"
+  }
+  if(params.PRICE_SERVICE) {
+     plan += " - Price Service: $env.PREVIOUS_PRICE_SERVICE_VERSION \r\n"
+  }
+  return plan
+}
+
+private void uploadTestResultFiles() {
+  try {
+     if (params.UI) {
+        jiraUploadAttachment idOrKey: env.CM_KEY, file: "./${env.uiTestFile}", site: 'Tesco Jira'
+        println("Uploaded test results for UI")
+     }
+    if (params.EXP_API) {
+        jiraUploadAttachment idOrKey: env.CM_KEY, file: "./${env.expAPITestFile}", site: 'Tesco Jira'
+        println("Uploaded test results for EXP-API")
+    }
+    if(params.PRICE_SERVICE) {
+        jiraUploadAttachment idOrKey: env.CM_KEY, file: 'price-service-automation-report.zip', site: 'Tesco Jira'
+        println("Uploaded test results for backend")
+     }
+  } catch (ignored) {
+    println('Failed to upload test results')
+  }
+}
+
+private boolean checkIfCMApproved() {
+  def cm = jiraGetIssue idOrKey: env.CM_KEY, site: 'Tesco Jira'
+  return cm.data.fields.status.id == '10402'
+}
+
+class JiraTicket {
+  JiraTicket(String issueKey, String summary, String issueTypeName) {
+    this.issueKey = issueKey
+    this.summary = summary
+    this.issueTypeName = issueTypeName
+  }
+  private String issueKey;
+  private String summary;
+  private String issueTypeName;
+
+  String getIssueKey() {
+    return issueKey
+  }
+
+  String getSummary() {
+    return summary
+  }
+
+  String getIssueTypeName() {
+    return issueTypeName
+  }
+}
